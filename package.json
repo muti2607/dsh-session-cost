@@ -1,0 +1,50 @@
+{
+  "name": "dsh-session-cost",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "DeepSeek Harness 会话消费面板：按会话统计 token 用量并折算花费，顶部显示账户真实扣费与余额。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cost",
+    "usage",
+    "billing"
+  ],
+  "license": "MIT",
+  "author": "muti2607",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muti2607/dsh-session-cost.git"
+  },
+  "bugs": {
+    "url": "https://github.com/muti2607/dsh-session-cost/issues"
+  },
+  "homepage": "https://github.com/muti2607/dsh-session-cost#readme",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}

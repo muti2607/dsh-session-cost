@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session cost",
+    "description": "Per-session token usage priced in CNY, shown in a Web panel so you can see what each session cost."
+  }
+}

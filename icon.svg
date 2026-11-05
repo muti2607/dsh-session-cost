@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Session cost">
+  <defs>
+    <linearGradient id="dshsc-g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4d8df1"/>
+      <stop offset="1" stop-color="#1f5fd0"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#dshsc-g)"/>
+  <circle cx="32" cy="30" r="15" fill="#ffffff" opacity="0.16"/>
+  <circle cx="32" cy="30" r="15" fill="none" stroke="#ffffff" stroke-width="2.4"/>
+  <path d="M25 22.5l7 9.5 7-9.5" fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M32 31.5v8.5" fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M26.5 32.5h11M26.5 36.5h11" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M15 50h34" fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" opacity="0.85"/>
+</svg>

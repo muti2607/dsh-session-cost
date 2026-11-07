@@ -141,7 +141,26 @@ Harness 保证 `reasoningTokens ⊆ outputTokens`，所以 reasoning 不单独�
     dshHome: ''                # 账本所在目录；留空则用 $DSH_HOME 或 ~/.dsh
     persistCache: true         # 扫描结果写入磁盘，重启后秒开
     cacheDir: ''               # 磁盘缓存目录；留空则用插件目录下的 .cache
+    autoUpdate: true           # 后台自动检查新版本（只检查不安装）
+    updateCheckHours: 6        # 自动检查间隔（小时）
+    autoInstallUpdates: false  # true = 发现新版本后静默安装（需重启生效）
 ```
+
+## 自更新
+
+插件内置更新器，走 **DSH 官方 `pluginManager.installBundle`**（内部是 pnpm），
+因此 lockfile 与实际安装始终一致——不会出现「插件自己改磁盘、pnpm 按旧
+lockfile 又改回去」的损坏（OFM 踩过的坑）。
+
+- `GET /api/session-cost/update`：检查新版本（不改动任何东西）
+- `POST /api/session-cost/update`：执行更新（仅 `github:` 安装可用；`link:` 本地安装会拒绝，避免改写源码树）
+- `GET /api/session-cost/version`：当前版本与安装来源
+
+默认行为：启动 60 秒后查一次，之后每 6 小时查一次；发现新版本只在日志里提醒，
+**不自动安装**（`autoInstallUpdates: true` 才会静默装）。更新生效可能需要重启 DSH。
+
+> 注意：运行中的 DSH 进程会缓存插件模块， reinstall 后即使热重载也可能仍跑旧代码，
+> 完整重启才能加载新版。
 
 ## 速度与磁盘缓存
 

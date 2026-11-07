@@ -25,8 +25,16 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, resolve as pathResolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  REPO as UPDATE_REPO,
+  INSTALL_SPEC as UPDATE_INSTALL_SPEC,
+  evaluateUpdate,
+  fetchLatestVersion,
+  inspectInstallSource,
+  readLocalVersion,
+} from './src/updater.js'
 
 const SCALE = 1e8
 const BEIJING_OFFSET_MS = 8 * 3600 * 1000
@@ -156,6 +164,10 @@ function normalizeConfig(config) {
     holidays: Array.isArray(c.holidays) && c.holidays.length
       ? c.holidays.map((d) => String(d))
       : DEFAULT_HOLIDAYS,
+    // 自更新：默认只检查不安装；autoInstallUpdates=true 才会静默装新版
+    autoUpdate: c.autoUpdate !== false,
+    updateCheckHours: Number(c.updateCheckHours) > 0 ? Number(c.updateCheckHours) : 6,
+    autoInstallUpdates: c.autoInstallUpdates === true,
   }
 }
 
@@ -1232,4 +1244,207 @@ export function apply(ctx, config) {
       /* 增量失败只影响新鲜度，下次扫描会纠正 */
     }
   })
+
+  // ---- 自更新：官方 installBundle 路线（与 codebuddy 插件同一套实现） ----
+  let updateTeardown = () => {}
+  ctx.inject(['webServer'], (scoped) => {
+    const webServer = scoped && scoped.webServer ? scoped.webServer : getService('webServer')
+    if (!webServer || typeof webServer.register !== 'function') return
+    updateTeardown = installUpdateRoutes(ctx, webServer, cfg)
+  })
+  return () => {
+    try { updateTeardown?.() } catch (err) { /* ignore */ }
+  }
+}
+
+/** 运行中插件的安装目录（读当前版本用）。 */
+function updaterModuleDir() {
+  return dirname(fileURLToPath(import.meta.url))
+}
+
+/**
+ * 注册自更新路由 + 后台自动检查。
+ *
+ * `GET  /api/session-cost/update`  只查版本，不改任何东西
+ * `POST /api/session-cost/update`  确认更新，交给 pluginManager.installBundle
+ *
+ * 更新走官方 installBundle（内部是 pnpm），lockfile 与实际安装一致，不会出现
+ * 「插件自己改磁盘、pnpm 按旧 lockfile 又改回去」的 OFM 式损坏。
+ * 默认只检查不自动装：静默替换运行中的代码会让人失去对版本的掌控，
+ * 且更新需要重启才生效。
+ */
+function installUpdateRoutes(ctx, webServer, cfg) {
+  const state = { last: null, checking: null }
+
+  function profileDirGuess() {
+    const explicit = String(process.env.DSH_PROFILE_DIR || '').trim()
+    if (explicit) return explicit
+    const home = String(process.env.DSH_HOME || '').trim()
+    if (home) {
+      const name = String(process.env.DSH_PROFILE || '').trim() || 'desktop'
+      return join(home, 'profiles', name)
+    }
+    // 从模块位置推导：<profile>/node_modules/dsh-session-cost/dist-or-root
+    const candidate = pathResolve(updaterModuleDir(), '..', '..')
+    try {
+      const doc = JSON.parse(readFileSync(join(candidate, 'package.json'), 'utf8'))
+      if (doc && typeof doc === 'object' && doc.dependencies !== undefined) return candidate
+    } catch (err) { /* ignore */ }
+    return null
+  }
+
+  async function check(force) {
+    const now = Date.now()
+    if (!force && state.last && now - state.last.checkedAt < 60_000) return state.last
+    if (state.checking) return state.checking
+    state.checking = (async () => {
+      const local = readLocalVersion(updaterModuleDir())
+      const profileDir = profileDirGuess()
+      const source = profileDir === null ? { spec: null, kind: 'unknown' } : inspectInstallSource(profileDir)
+      try {
+        const remote = await fetchLatestVersion(fetch)
+        const verdict = evaluateUpdate(local, remote.version)
+        const payload = {
+          ok: true,
+          ...verdict,
+          checkedAt: remote.checkedAt,
+          installSource: source,
+          // link: 安装指向源码树，自更新会改写它，必须禁止
+          updatable: source.kind === 'git',
+          repo: UPDATE_REPO,
+          installSpec: UPDATE_INSTALL_SPEC,
+        }
+        state.last = payload
+        return payload
+      } catch (error) {
+        // 检查失败不缓存，下次立即重试
+        return {
+          ok: false,
+          error: String((error && error.message) || error),
+          localVersion: local,
+          checkedAt: Date.now(),
+          installSource: source,
+          updatable: source.kind === 'git',
+          repo: UPDATE_REPO,
+          installSpec: UPDATE_INSTALL_SPEC,
+        }
+      } finally {
+        state.checking = null
+      }
+    })()
+    return state.checking
+  }
+
+  async function applyUpdate() {
+    const manager = ctx.get?.('pluginManager')
+    if (!manager || typeof manager.installBundle !== 'function') {
+      return { ok: false, error: '当前组合没有 pluginManager，无法自动更新；请手动执行 dsh plugin --profile desktop add ' + UPDATE_INSTALL_SPEC }
+    }
+    const source = inspectInstallSource(profileDirGuess() ?? '')
+    if (source.kind !== 'git') {
+      return {
+        ok: false,
+        error: source.kind === 'local'
+          ? '当前是本地目录安装（link:），自更新会改写源码树。请改用 ' + UPDATE_INSTALL_SPEC + ' 安装后再启用自更新。'
+          : '无法确认安装来源，已取消更新。',
+        installSource: source,
+      }
+    }
+    try {
+      const result = await manager.installBundle(UPDATE_INSTALL_SPEC, { enabled: true })
+      const applied = result?.application === 'applied'
+      return {
+        ok: applied || result?.application === 'restart-required',
+        application: result?.application,
+        restartRequired: result?.application === 'restart-required',
+        version: result?.version,
+        error: result?.error?.diagnostic,
+        installSource: source,
+      }
+    } catch (error) {
+      return { ok: false, error: String((error && error.message) || error), installSource: source }
+    }
+  }
+
+  const dispose = webServer.register({
+    kind: 'prefix',
+    path: '/api/session-cost',
+    handler: async (req, res) => {
+      let url
+      try {
+        url = new URL(String((req && req.url) || '/'), 'http://localhost')
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: 'bad-url' })
+        return
+      }
+      const json = (status, body) => sendJson(res, status, body)
+      try {
+        if (url.pathname === '/api/session-cost/update') {
+          if (String((req && req.method) || 'GET').toUpperCase() === 'GET') {
+            return json(200, await check(url.searchParams.get('force') === '1'))
+          }
+          if (String((req && req.method) || '').toUpperCase() === 'POST') {
+            return json(200, await applyUpdate())
+          }
+          return json(405, { ok: false, error: 'method not allowed' })
+        }
+        if (url.pathname === '/api/session-cost/version') {
+          const dir = updaterModuleDir()
+          return json(200, {
+            ok: true,
+            version: readLocalVersion(dir),
+            repo: UPDATE_REPO,
+            moduleDir: dir,
+            profileDir: profileDirGuess(),
+            installSource: inspectInstallSource(profileDirGuess() ?? ''),
+          })
+        }
+        return json(404, { ok: false, error: 'not found' })
+      } catch (error) {
+        return json(500, { ok: false, error: String((error && error.message) || error) })
+      }
+    },
+  })
+
+  // 后台自动检查：启动 60s 后一次，之后每 updateCheckHours 小时一次。
+  // 只检查不自动装（除非 autoInstallUpdates=true）。
+  let timers = null
+  if (cfg.autoUpdate !== false) {
+    const periodMs = Math.max(1, cfg.updateCheckHours) * 3_600_000
+    const run = async () => {
+      try {
+        const result = await check(true)
+        if (!result.ok) {
+          try { console.warn(LOG_PREFIX + ' 更新检查失败：' + result.error) } catch (err) { /* ignore */ }
+        } else if (result.available) {
+          try {
+            console.warn(LOG_PREFIX + ' 发现新版本 ' + result.remoteVersion + '（当前 ' + result.localVersion + '）。'
+              + (result.updatable ? ' 可 POST /api/session-cost/update 更新。'
+                : ' 当前为本地目录安装，请改用 ' + UPDATE_INSTALL_SPEC + ' 安装。'))
+          } catch (err) { /* ignore */ }
+          if (cfg.autoInstallUpdates === true && result.updatable) {
+            const applied = await applyUpdate()
+            try { console.info?.(LOG_PREFIX + ' 自动更新' + (applied.ok ? '成功' : '失败') + '：' + (applied.version ?? applied.error ?? '')) } catch (err2) { /* ignore */ }
+          }
+        }
+      } catch (error) {
+        try { console.warn(LOG_PREFIX + ' 自动更新任务异常：' + String((error && error.message) || error)) } catch (err) { /* ignore */ }
+      }
+    }
+    const initial = setTimeout(run, 60_000)
+    initial.unref?.()
+    const interval = setInterval(run, periodMs)
+    interval.unref?.()
+    timers = { initial, interval }
+  }
+
+  return () => {
+    try {
+      if (timers) {
+        clearTimeout(timers.initial)
+        clearInterval(timers.interval)
+      }
+    } catch (err) { /* ignore */ }
+    try { dispose?.() } catch (err) { /* ignore */ }
+  }
 }

@@ -31,9 +31,10 @@ const EXPECTED = 1 + 0.04 + 13.5
 
 let captured = null
 let capturedTool = null
+const capturedRoutes = []
 const listeners = []
 const services = {
-  webServer: { register(route) { captured = route; return () => { captured = null } } },
+  webServer: { register(route) { capturedRoutes.push(route); captured = route; return () => {} } },
   tools: { register(definition) { capturedTool = definition; return () => { capturedTool = null } } },
   sessionQuery: {
     async listSessions() {
@@ -61,8 +62,13 @@ const ctx = {
 
 apply(ctx, { dshHome: 'D:/dfyqq/dfyduihua娑堣垂璁板綍/__no_ledger__' })
 
-if (!captured) throw new Error('route was not registered')
-if (captured.path !== '/dsh-session-cost/data.json') throw new Error('unexpected path ' + captured.path)
+const dataRoute = capturedRoutes.find((r) => r.path === '/dsh-session-cost/data.json')
+if (!dataRoute) throw new Error('data route missing; got: ' + capturedRoutes.map((r) => r.path).join(', '))
+captured = dataRoute
+// 自更新路由必须同时存在
+if (!capturedRoutes.some((r) => r.path === '/api/session-cost')) {
+  throw new Error('update route missing; got: ' + capturedRoutes.map((r) => r.path).join(', '))
+}
 
 const chunks = []
 await captured.handler(
@@ -171,8 +177,9 @@ else {
 
   let ledger = null
   let ledgerTool = null
+  const ledgerRoutes = []
   const ledgerServices = {
-    webServer: { register(r) { ledger = r; return () => {} } },
+    webServer: { register(r) { ledgerRoutes.push(r); ledger = r; return () => {} } },
     tools: { register(d) { ledgerTool = d; return () => {} } },
     sessionQuery: {
       async listSessions() {
@@ -198,6 +205,8 @@ else {
     get(name) { return ledgerServices[name] },
   }
   apply(ledgerCtx, { dshHome: ledDir })
+  ledger = ledgerRoutes.find((r) => r.path === '/dsh-session-cost/data.json')
+  if (!ledger) throw new Error('ledger data route missing: ' + ledgerRoutes.map((r) => r.path).join(', '))
 
   const body = []
   await ledger.handler(

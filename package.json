@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-cost",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "每个会话花了多少钱：按会话折叠 token 用量并折算成人民币，支持按日期查询当天用量，在 Web 面板里查看。",
@@ -15,16 +15,19 @@
     ".": "./index.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.svg",
+    "./updater": "./src/updater.js"
   },
   "files": [
     "index.js",
     "client.js",
+    "src/updater.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "verify.mjs"
+    "verify.mjs",
+    "test/verify-updater.mjs"
   ],
   "dsh": {
     "bundle": {

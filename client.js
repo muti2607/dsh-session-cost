@@ -25,6 +25,14 @@ window.__ModuleLoader__.load({
       'panel.subtitle': '按会话折叠真实 token 用量，用峰谷价目表折算成人民币',
       'panel.refresh': '刷新',
       'panel.refreshing': '刷新中…',
+      'panel.dayLabel': '查询日期',
+      'panel.today': '今天',
+      'panel.daySummary': '{day} 用量',
+      'panel.dayCalls': '调用',
+      'panel.daySessions': '会话',
+      'panel.dayCost': '估算花费',
+      'panel.dayReal': '账本实扣',
+      'panel.dayEmpty': '这一天没有调用记录',
       'panel.loading': '正在读取会话日志…',
       'panel.peak': '峰时价',
       'panel.valley': '谷时价',
@@ -74,6 +82,14 @@ window.__ModuleLoader__.load({
       'panel.subtitle': 'Real token usage per session, priced with peak/off-peak rates',
       'panel.refresh': 'Refresh',
       'panel.refreshing': 'Refreshing…',
+      'panel.dayLabel': 'Query date',
+      'panel.today': 'Today',
+      'panel.daySummary': '{day} usage',
+      'panel.dayCalls': 'Calls',
+      'panel.daySessions': 'Sessions',
+      'panel.dayCost': 'Estimated',
+      'panel.dayReal': 'Actual debit',
+      'panel.dayEmpty': 'No calls on this day',
       'panel.loading': 'Reading session logs…',
       'panel.peak': 'Peak rate',
       'panel.valley': 'Off-peak rate',
@@ -128,6 +144,11 @@ window.__ModuleLoader__.load({
 .dshsc-btn{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:7px;padding:5px 12px;font-size:12px;cursor:pointer;font-family:inherit}
 .dshsc-btn:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
 .dshsc-btn:disabled{opacity:.55;cursor:default}
+.dshsc-day{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-secondary);white-space:nowrap}
+.dshsc-day input[type=date]{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:7px;padding:4px 8px;font-size:12px;font-family:inherit;color-scheme:light dark}
+.dshsc-daybar{display:flex;align-items:center;flex-wrap:wrap;gap:14px;padding:10px 14px;margin-bottom:14px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);font-size:12px;font-variant-numeric:tabular-nums}
+.dshsc-daybar-title{font-weight:600;color:var(--dsw-alias-label-primary)}
+.dshsc-daybar-empty{color:var(--dsw-alias-label-secondary)}
 .dshsc-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
 .dshsc-card{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);border-radius:10px;padding:10px 13px}
 .dshsc-card-label{font-size:11px;color:var(--dsw-alias-label-secondary);margin-bottom:4px}
@@ -257,6 +278,8 @@ window.__ModuleLoader__.load({
           })
           const [sort, setSort] = React.useState({ key: 'cost', dir: -1 })
           const [expanded, setExpanded] = React.useState({})
+          // 查询日期（北京时间 YYYY-MM-DD）。空串 = 今天，由后端解析。
+          const [day, setDay] = React.useState('')
           const aliveRef = React.useRef(true)
 
           const load = React.useCallback((mode) => {
@@ -267,7 +290,10 @@ window.__ModuleLoader__.load({
             const force = mode === 'refresh'
             setState((prev) => (prev.data ? prev : { ...prev, loading: true }))
             setState((prev) => ({ ...prev, busy: true, action: mode }))
-            const url = API + (force ? '?refresh=1' : '')
+            const params = []
+            if (force) params.push('refresh=1')
+            if (day) params.push('day=' + encodeURIComponent(day))
+            const url = API + (params.length ? '?' + params.join('&') : '')
             fetch(url, { cache: 'no-store' })
               .then((response) => {
                 if (!response.ok) throw new Error('HTTP ' + response.status)
@@ -299,7 +325,7 @@ window.__ModuleLoader__.load({
                 if (!aliveRef.current) return
                 setState((prev) => ({ loading: false, busy: false, data: prev.data, error: String((err && err.message) || err) }))
               })
-          }, [])
+          }, [day])
 
           const pollSoonRef = React.useRef(false)
           const loadRef = React.useRef(load)
@@ -464,6 +490,22 @@ window.__ModuleLoader__.load({
                   t('panel.subtitle'),
                   data && data.generatedAt ? ' · ' + t('panel.updated') + ' ' + formatWhen(data.generatedAt) : '')),
               h('div', { className: 'dshsc-actions' },
+                h('label', { className: 'dshsc-day' },
+                  h('span', null, t('panel.dayLabel')),
+                  h('input', {
+                    type: 'date',
+                    value: day,
+                    onChange: (event) => {
+                      const next = String((event && event.target && event.target.value) || '')
+                      setDay(next)
+                      // 状态更新后立刻用新日期拉一次，不用等轮询
+                      setTimeout(() => loadRef.current && loadRef.current('poll'), 0)
+                    },
+                  }),
+                  h('button', {
+                    className: 'dshsc-btn',
+                    onClick: () => { setDay(''); setTimeout(() => loadRef.current && loadRef.current('poll'), 0) },
+                  }, t('panel.today'))),
                 data && Number(data.scanning) > 0
                   ? h('span', { className: 'dshsc-chip' }, t('panel.scanning').replace('{n}', String(data.scanning)))
                   : null,
@@ -478,6 +520,21 @@ window.__ModuleLoader__.load({
             state.error ? h('div', { className: 'dshsc-error' },
               h('span', null, t('panel.error') + ': ' + state.error),
               h('button', { className: 'dshsc-btn', onClick: () => load('refresh') }, t('panel.retry'))) : null,
+            data && data.day ? h('div', { className: 'dshsc-daybar' },
+              h('span', { className: 'dshsc-daybar-title' },
+                t('panel.daySummary').replace('{day}', String(data.day.day))),
+              Number(data.day.calls) > 0
+                ? h(React.Fragment, null,
+                  h('span', null, t('panel.dayCalls') + ' ' + formatCount(data.day.calls)),
+                  h('span', null, t('panel.daySessions') + ' ' + formatCount(data.day.sessions)),
+                  h('span', null, t('panel.dayCost') + ' ' + formatMoney(data.day.cost, currency)),
+                  Number(data.day.ledgerDebit) > 0
+                    ? h('span', null, t('panel.dayReal') + ' ' + formatMoney(data.day.ledgerDebit, currency))
+                    : null,
+                  h('span', null, formatTokens(data.day.tokens && data.day.tokens.input)
+                    + ' / ' + formatTokens(data.day.tokens && data.day.tokens.cacheRead)
+                    + ' / ' + formatTokens(data.day.tokens && data.day.tokens.output)))
+                : h('span', { className: 'dshsc-daybar-empty' }, t('panel.dayEmpty'))) : null,
             h('div', { className: 'dshsc-cards' }, cards),
             hasLedger && led.coverage && Number(led.coverage.missingBeforeDays) > 0
               ? h('div', { className: 'dshsc-note' },

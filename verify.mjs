@@ -222,5 +222,77 @@ else {
   rmSync(ledDir, { recursive: true, force: true })
 }
 
+// ---- 按天查询（day=YYYY-MM-DD）----
+// 5 条合成事件全在 2026-11-02（T_VALLEY 20:00 / T_PEAK 15:00 都是 +08:00），
+// 所以查这一天应拿到全部 5 次调用；查隔天应为空而不是报错。
+{
+  const read = async (url) => {
+    const c = []
+    await captured.handler(
+      { method: 'GET', url, headers: {} },
+      { statusCode: 0, setHeader() {}, end(b) { c.push(b) } },
+    )
+    return JSON.parse(c.join(''))
+  }
+  const onDay = await read('/dsh-session-cost/data.json?wait=1&day=2026-11-02')
+  if (!onDay.ok) fail('day query not ok')
+  if (!onDay.day) fail('day report missing')
+  if (onDay.day.day !== '2026-11-02') fail('wrong day echoed: ' + onDay.day.day)
+  if (onDay.day.calls !== 5) fail('day.calls should be 5, got ' + onDay.day.calls)
+  if (onDay.day.billedCalls !== 3) fail('day.billedCalls should be 3, got ' + onDay.day.billedCalls)
+  if (onDay.day.freeCalls !== 2) fail('day.freeCalls should be 2, got ' + onDay.day.freeCalls)
+  if (onDay.day.sessions !== 1) fail('day.sessions should be 1, got ' + onDay.day.sessions)
+  // 当天金额 = 三条计费事件的估算合计（与累计一致，因为事件都在同一天）
+  if (Math.abs(onDay.day.cost - EXPECTED) > 1e-9) fail('day.cost ' + onDay.day.cost + ' != ' + EXPECTED)
+  // token 分项
+  const tk = onDay.day.tokens
+  const expectIn = 1_000_000 + 0 + 0 + 5_000_000 + 5_000_000
+  const expectCache = 0 + 1_000_000 + 0 + 0 + 0
+  const expectOut = 0 + 0 + 1_000_000 + 5_000_000 + 5_000_000
+  if (tk.input !== expectIn) fail('day.tokens.input ' + tk.input + ' != ' + expectIn)
+  if (tk.cacheRead !== expectCache) fail('day.tokens.cacheRead ' + tk.cacheRead + ' != ' + expectCache)
+  if (tk.output !== expectOut) fail('day.tokens.output ' + tk.output + ' != ' + expectOut)
+  if (tk.total !== expectIn + expectOut + expectCache) fail('day.tokens.total')
+  // 按会话 / 按模型明细
+  if (!Array.isArray(onDay.day.sessionRows) || onDay.day.sessionRows.length !== 1) fail('day.sessionRows list')
+  if (onDay.day.sessionRows[0].calls !== 5) fail('day.sessionRows[0].calls')
+  if (!Array.isArray(onDay.day.models) || onDay.day.models.length !== 4) fail('day.models should have 4 buckets, got ' + (onDay.day.models || []).length)
+  for (const m of onDay.day.models) {
+    if ((m.provider === 'trae' || m.provider === 'cline') && Math.abs(m.cost) > 1e-9) {
+      fail('free provider charged on day: ' + m.provider)
+    }
+  }
+  // 行级 day 数据
+  const dayRow = onDay.sessions[0]
+  if (!dayRow.day || dayRow.day.calls !== 5) fail('row.day missing/wrong')
+
+  // 无活动的另一天：全 0，不能报错、不能把累计数据漏过去
+  const empty = await read('/dsh-session-cost/data.json?wait=1&day=2026-11-03')
+  if (!empty.ok) fail('empty day query not ok')
+  if (empty.day.day !== '2026-11-03') fail('empty day echo')
+  if (empty.day.calls !== 0 || empty.day.cost !== 0 || empty.day.sessions !== 0) {
+    fail('empty day should be all zero: ' + JSON.stringify(empty.day))
+  }
+  if (empty.day.sessionRows.length !== 0) fail('empty day sessionRows list')
+  if (empty.sessions[0].day !== null) fail('row.day should be null when no activity')
+
+  // 非法日期回退到今天，不应报错
+  const bad = await read('/dsh-session-cost/data.json?wait=1&day=not-a-date')
+  if (!bad.ok || !bad.day || !/^\d{4}-\d{2}-\d{2}$/.test(bad.day.day)) fail('invalid day should fall back to today')
+
+  // 不传 day 时默认今天，且返回结构里仍有 day
+  const dflt = await read('/dsh-session-cost/data.json?wait=1')
+  if (!dflt.day || !/^\d{4}-\d{2}-\d{2}$/.test(dflt.day.day)) fail('default day missing')
+  const today = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10)
+  if (dflt.day.day !== today) fail('default day should be Beijing today: ' + dflt.day.day + ' != ' + today)
+
+  // 工具摘要里应带「【日期 用量】」
+  if (typeof capturedTool?.output?.render === 'function') {
+    const text = capturedTool.output.render({}, onDay).map((b) => b.text).join('\n')
+    if (!text.includes('2026-11-02 用量')) fail('tool summary missing day section')
+    if (!text.includes('5 次调用')) fail('tool summary missing day calls')
+  }
+}
+
 console.log(JSON.stringify({ ok: !process.exitCode, cost: row.cost, expected: EXPECTED, models: row.models }, null, 2))
 

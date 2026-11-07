@@ -239,7 +239,29 @@ function newEntry() {
     todayUnits: 0,
     updatedAt: 0,
     models: new Map(),
+    // 按北京日期归档的用量：day(YYYY-MM-DD) -> 用量对象。
+    // 每条 assistant/message 事件的 event.time 决定它属于哪一天，
+    // 因此「按天查询」是精确的逐事件统计，不是把会话总额摊到某一天。
+    days: new Map(),
     error: '',
+  }
+}
+
+/** 一天的用量桶（新桶全 0）。 */
+function newDayBucket(day) {
+  return {
+    day,
+    calls: 0,
+    billedCalls: 0,
+    freeCalls: 0,
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    reasoning: 0,
+    costUnits: 0,
+    // 当天的模型分项：'provider/model' -> { calls, tokens, costUnits, billed }
+    models: new Map(),
   }
 }
 
@@ -272,6 +294,23 @@ function pickCacheDir(cfg) {
   return ''
 }
 
+/** 把一天的桶转成可 JSON 化的对象。 */
+function dayBucketToJson(bucket) {
+  return {
+    day: bucket.day,
+    calls: bucket.calls,
+    billedCalls: bucket.billedCalls,
+    freeCalls: bucket.freeCalls,
+    input: bucket.input,
+    output: bucket.output,
+    cacheRead: bucket.cacheRead,
+    cacheWrite: bucket.cacheWrite,
+    reasoning: bucket.reasoning,
+    costUnits: bucket.costUnits,
+    models: [...bucket.models.values()],
+  }
+}
+
 function entryToJson(entry) {
   return {
     computedAt: entry.computedAt,
@@ -286,6 +325,7 @@ function entryToJson(entry) {
     todayUnits: entry.todayUnits,
     updatedAt: entry.updatedAt,
     models: [...entry.models.values()],
+    days: [...entry.days.values()].map(dayBucketToJson),
     error: entry.error || '',
   }
 }
@@ -326,6 +366,29 @@ function entryFromJson(raw) {
       tokens: Number(bucket.tokens) || 0,
       costUnits: Number(bucket.costUnits) || 0,
     })
+  }
+  // 旧缓存没有 days：保持空 Map，扫描时按 watermark 增量补齐。
+  // 但缓存一旦被判定为「需要重扫」，会一次性把所有事件重新折叠，days 自然完整。
+  entry.days = new Map()
+  for (const rawDay of Array.isArray(raw.days) ? raw.days : []) {
+    if (!rawDay || typeof rawDay !== 'object' || typeof rawDay.day !== 'string') continue
+    const bucket = newDayBucket(rawDay.day)
+    for (const k of ['calls', 'billedCalls', 'freeCalls', 'input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'costUnits']) {
+      bucket[k] = Number(rawDay[k]) || 0
+    }
+    for (const m of Array.isArray(rawDay.models) ? rawDay.models : []) {
+      if (!m || typeof m !== 'object') continue
+      const key = String(m.provider ? m.provider + '/' : '') + String(m.model || 'unknown')
+      bucket.models.set(key, {
+        model: String(m.model || 'unknown'),
+        provider: String(m.provider || ''),
+        billed: m.billed !== false,
+        calls: Number(m.calls) || 0,
+        tokens: Number(m.tokens) || 0,
+        costUnits: Number(m.costUnits) || 0,
+      })
+    }
+    entry.days.set(bucket.day, bucket)
   }
   return entry
 }
@@ -376,15 +439,41 @@ function foldEvent(entry, event, pricer) {
   if (billed) entry.billedCalls += 1
   else entry.freeCalls += 1
 
-  const key = (provider ? provider + '/' : '') + (model || 'unknown')
-  let bucket = entry.models.get(key)
+  // ---- 按天归档 ----
+  let dayBucket = entry.days.get(day)
+  if (!dayBucket) {
+    dayBucket = newDayBucket(day)
+    entry.days.set(day, dayBucket)
+  }
+  dayBucket.calls += 1
+  if (billed) dayBucket.billedCalls += 1
+  else dayBucket.freeCalls += 1
+  dayBucket.input += input
+  dayBucket.output += output
+  dayBucket.cacheRead += cacheRead
+  dayBucket.cacheWrite += cacheWrite
+  dayBucket.reasoning += reasoning
+  dayBucket.costUnits += units
+
+  const modelKey = (provider ? provider + '/' : '') + (model || 'unknown')
+  let bucket = entry.models.get(modelKey)
   if (!bucket) {
     bucket = { model: model || 'unknown', provider, billed, calls: 0, tokens: 0, costUnits: 0 }
-    entry.models.set(key, bucket)
+    entry.models.set(modelKey, bucket)
   }
   bucket.calls += 1
   bucket.tokens += input + output + cacheRead
   bucket.costUnits += units
+
+  // 当天的模型分项
+  let dayModel = dayBucket.models.get(modelKey)
+  if (!dayModel) {
+    dayModel = { model: model || 'unknown', provider, billed, calls: 0, tokens: 0, costUnits: 0 }
+    dayBucket.models.set(modelKey, dayModel)
+  }
+  dayModel.calls += 1
+  dayModel.tokens += input + output + cacheRead
+  dayModel.costUnits += units
 }
 
 async function mapLimit(items, limit, fn) {
@@ -447,9 +536,40 @@ function summarizeReport(report, limit) {
   const peak = !!(report.pricing && report.pricing.peakNow)
   const lines = []
   lines.push('会话消费（' + currency + '，当前' + (peak ? '峰时价' : '谷时价') + '）')
+
+  // 按天查询的结果优先展示：调用方明确问「今天/某天花多少」时，
+  // 不该让累计总额把当日数字淹没。
+  const day = report.day
+  if (day && typeof day === 'object') {
+    const tk = day.tokens || {}
+    lines.push('【' + day.day + ' 用量】' + (day.calls || 0) + ' 次调用'
+      + ' · ' + (day.sessions || 0) + ' 个会话'
+      + ' · 输入 ' + Number(tk.input || 0).toLocaleString()
+      + '（命中 ' + Number(tk.cacheRead || 0).toLocaleString() + '）'
+      + ' · 输出 ' + Number(tk.output || 0).toLocaleString()
+      + ' · 估算 ' + formatMoneyText(day.cost, currency))
+    if (Number(day.ledgerDebit) > 0) {
+      lines.push('  该日真实扣费 ' + formatMoneyText(day.ledgerDebit, currency) + '（余额账本，权威）')
+    }
+    if (Number(day.freeCalls) > 0) {
+      lines.push('  其中 ' + day.freeCalls + ' 次走免费渠道，未计费')
+    }
+    const dayModels = Array.isArray(day.models) ? day.models.slice(0, 3) : []
+    for (const m of dayModels) {
+      lines.push('  · ' + (m.provider ? m.provider + '/' : '') + m.model
+        + ' ' + formatMoneyText(m.cost, currency) + ' / ' + (m.calls || 0) + ' 次')
+    }
+    const daySessions = Array.isArray(day.sessionRows) ? day.sessionRows.slice(0, 5) : []
+    for (const s of daySessions) {
+      lines.push('  · ' + (s.title || s.id || '(无标题)')
+        + ' ' + formatMoneyText(s.cost, currency) + ' / ' + (s.calls || 0) + ' 次')
+    }
+    lines.push('—— 以下为累计数据 ——')
+  }
+
   const led = report.ledger || {}
   if (led.available) {
-    lines.push('真实扣费 ' + formatMoneyText(totals.cost, currency)
+    lines.push('真实扣费（累计） ' + formatMoneyText(totals.cost, currency)
       + ' · 今日 ' + formatMoneyText(totals.todayCost, currency)
       + (led.lastBalance != null ? ' · 余额 ' + formatMoneyText(led.lastBalance, currency) : '')
       + '（来自余额账本，权威）')
@@ -472,7 +592,7 @@ function summarizeReport(report, limit) {
         + '；仅作参考）')
     }
   } else {
-    lines.push('合计 ' + formatMoneyText(totals.cost, currency)
+    lines.push('累计 ' + formatMoneyText(totals.cost, currency)
       + ' · 今日 ' + formatMoneyText(totals.todayCost, currency)
       + ' · ' + (totals.sessions || 0) + ' 个会话（' + (totals.sessionsWithCost || 0) + ' 个花钱）'
       + '（无余额账本，以下为 token 估算，可能与真实扣费有偏差）')
@@ -654,10 +774,12 @@ export function apply(ctx, config) {
     return entry
   }
 
-  function rowFrom(record, entry, title) {
+  function rowFrom(record, entry, title, day) {
     const header = (record && record.header) || {}
     const today = beijingDateString(Date.now())
+    const queryDay = day || today
     const totals = entry.totals
+    const dayBucket = queryDay ? entry.days.get(queryDay) : null
     const models = [...entry.models.values()]
       .map((bucket) => ({
         model: bucket.model,
@@ -695,6 +817,32 @@ export function apply(ctx, config) {
       freeCalls: entry.freeCalls,
       models: models.slice(0, 8),
       modelCount: models.length,
+      // 所查日期的用量；当天没有活动时全部为 0（不是「缺失」）。
+      day: dayBucket ? {
+        day: queryDay,
+        calls: dayBucket.calls,
+        billedCalls: dayBucket.billedCalls,
+        freeCalls: dayBucket.freeCalls,
+        tokens: {
+          input: dayBucket.input,
+          output: dayBucket.output,
+          cacheRead: dayBucket.cacheRead,
+          cacheWrite: dayBucket.cacheWrite,
+          reasoning: dayBucket.reasoning,
+          total: dayBucket.input + dayBucket.output + dayBucket.cacheRead,
+        },
+        cost: dayBucket.costUnits / SCALE,
+        models: [...dayBucket.models.values()]
+          .map((m) => ({
+            model: m.model,
+            provider: m.provider,
+            billed: m.billed,
+            calls: m.calls,
+            tokens: m.tokens,
+            cost: m.costUnits / SCALE,
+          }))
+          .sort((a, b) => b.cost - a.cost),
+      } : null,
       error: entry.error || '',
     }
   }
@@ -710,6 +858,10 @@ export function apply(ctx, config) {
    */
   async function buildReport(force, opts) {
     const options = opts && typeof opts === 'object' ? opts : {}
+    // 查询日期：不传就是今天（北京时区）。格式 YYYY-MM-DD，非法值回退今天。
+    const queryDay = /^\d{4}-\d{2}-\d{2}$/.test(options.day || '')
+      ? options.day
+      : beijingDateString(Date.now())
     const wait = options.wait !== false   // 默认等待（保持旧行为，路由自己决定要不要等）
     const strict = !!options.strict        // 必须最新（Agent 工具）
     const sessionQuery = getService('sessionQuery')
@@ -807,7 +959,7 @@ export function apply(ctx, config) {
     }
     for (const pair of pairs) {
       if (!pair) continue
-      const row = rowFrom(pair.record, pair.entry, titles.get(String(pair.record.header.id)))
+      const row = rowFrom(pair.record, pair.entry, titles.get(String(pair.record.header.id)), queryDay)
       rows.push(row)
       totals.sessions += 1
       if (row.cost > 0) totals.sessionsWithCost += 1
@@ -897,12 +1049,70 @@ export function apply(ctx, config) {
 
     rows.sort((a, b) => (b.cost - a.cost) || (b.updatedAt - a.updatedAt))
 
+    // ---- 所查日期的汇总 ----
+    // 只统计「当天真的有调用」的行；day === null 表示该会话当天无活动。
+    const dayTotals = {
+      day: queryDay,
+      cost: 0,
+      calls: 0,
+      billedCalls: 0,
+      freeCalls: 0,
+      sessions: 0,
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
+      models: new Map(),
+      // 账本里这一天的真实扣费（最权威），与逐事件估算并列展示
+      ledgerDebit: 0,
+    }
+    for (const row of rows) {
+      const d = row.day
+      if (!d || !(d.calls > 0)) continue
+      dayTotals.sessions += 1
+      dayTotals.cost += d.cost
+      dayTotals.calls += d.calls
+      dayTotals.billedCalls += d.billedCalls
+      dayTotals.freeCalls += d.freeCalls
+      for (const k of ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'total']) {
+        dayTotals.tokens[k] += d.tokens[k]
+      }
+      for (const m of d.models) {
+        const key = (m.provider ? m.provider + '/' : '') + m.model
+        const agg = dayTotals.models.get(key) || {
+          model: m.model, provider: m.provider, billed: m.billed,
+          calls: 0, tokens: 0, cost: 0,
+        }
+        agg.calls += m.calls
+        agg.tokens += m.tokens
+        agg.cost += m.cost
+        dayTotals.models.set(key, agg)
+      }
+    }
+    // 账本按天记的是真实扣减；查询历史日期时它比逐事件估算更准
+    if (ledgerInfo.available) {
+      const ledgerDay = ledgerInfo.days.find((x) => x.day === queryDay)
+      dayTotals.ledgerDebit = ledgerDay ? ledgerDay.debit : 0
+    }
+    const dayReport = {
+      ...dayTotals,
+      models: [...dayTotals.models.values()].sort((a, b) => b.cost - a.cost),
+      // 当天有活动的会话，按当天花费降序（不是按累计花费）
+      sessionRows: rows
+        .filter((r) => r.day && r.day.calls > 0)
+        .map((r) => ({
+          id: r.id, title: r.title, cwd: r.cwd,
+          calls: r.day.calls, cost: r.day.cost,
+          tokens: r.day.tokens,
+          models: r.day.models.slice(0, 5),
+        }))
+        .sort((a, b) => b.cost - a.cost),
+    }
+
     return {
       ok: true,
       currency: pricer.currency,
       pricing: pricer.describe(),
       totals,
       ledger: ledgerInfo,
+      day: dayReport,
       sessions: rows,
       scannedAt: now,
     }
@@ -933,9 +1143,12 @@ export function apply(ctx, config) {
         }
         let force = false
         let wait = false
+        let day = ''
         try {
           const url = new URL(String((req && req.url) || ROUTE_DATA), 'http://localhost')
           force = url.searchParams.get('refresh') === '1'
+          // day=YYYY-MM-DD 查询指定日期的用量；不传或非法则默认今天（北京时区）。
+          day = String(url.searchParams.get('day') || '')
           // full=1 / wait=1 → 等全部扫完再返回（首次打开、用户主动刷新才用）；
           // 默认 → 立刻返回缓存快照，缺的由后台补。
           const f = url.searchParams.get('full')
@@ -945,7 +1158,7 @@ export function apply(ctx, config) {
           // 这样「点刷新」也能立刻出结果，后台扫完面板下次轮询自然刷新。
         } catch (err) { /* ignore */ }
         try {
-          const report = await buildReport(force, { wait })
+          const report = await buildReport(force, { wait, day })
           report.generatedAt = Date.now()
           report.wait = wait
           // 还有多少会话排队/正在后台补，给面板显示「后台仍在计算」
@@ -965,8 +1178,9 @@ export function apply(ctx, config) {
     return tools.register({
       name: 'session_cost_report',
       description: '按会话统计 DeepSeek Harness 的 token 用量并折算成花费（默认人民币，按峰谷价目表估算）。'
-        + '返回每个会话的金额、调用/轮次、输入（含缓存命中）与输出 tokens、以及按模型的明细，'
-        + '按花费降序。适合回答「这次会话/最近花了多少钱」，或找出最烧钱的会话；不修改任何数据。',
+        + '返回每个会话的金额、调用/轮次、输入（含缓存命中）与输出 tokens、以及按模型的明细，按花费降序。'
+        + '可传 day=YYYY-MM-DD 查询指定日期（北京时区）当天的用量：调用数、token 分项、金额、当天有活动的会话与模型明细；'
+        + '不传 day 则默认今天。适合回答「今天/某天花多少钱」「这次会话花了多少钱」；不修改任何数据。',
       parameters: {
         type: 'object',
         properties: {
@@ -975,6 +1189,11 @@ export function apply(ctx, config) {
             minimum: 1,
             maximum: 200,
             description: '只返回花费最高的前 N 个会话，默认 20；总计仍是全部会话的合计。',
+          },
+          day: {
+            type: 'string',
+            pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}$',
+            description: '查询日期（北京时间，YYYY-MM-DD），例如 2026-11-07。不传则默认今天。',
           },
           refresh: {
             type: 'boolean',
@@ -992,7 +1211,7 @@ export function apply(ctx, config) {
       async execute(args) {
         const input = args && typeof args === 'object' ? args : {}
         // 工具调用一定要拿到最新完整数据，所以显式要求 strict
-        const report = await buildReport(!!input.refresh, { wait: true, strict: true })
+        const report = await buildReport(!!input.refresh, { wait: true, strict: true, day: String(input.day || '') })
         report.generatedAt = Date.now()
         return report
       },
